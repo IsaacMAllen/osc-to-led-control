@@ -8,15 +8,22 @@ RGB_LIBDIR=$(RGB_LIB_DISTRIBUTION)/lib
 RGB_LIBRARY_NAME=rgbmatrix
 RGB_LIBRARY=$(RGB_LIBDIR)/lib$(RGB_LIBRARY_NAME).a
 
-LDFLAGS+=-L$(RGB_LIBDIR) -l$(RGB_LIBRARY_NAME) -lrt -lm -lpthread
+LIBLO_LIB_DISTRIBUTION=liblo
+
+LDFLAGS+=-L$(RGB_LIBDIR) -l$(RGB_LIBRARY_NAME) -lrt -lm -lpthread -llo
 
 all : lc4
 
-lc4 : $(OBJECTS) $(RGB_LIBRARY)
+lc4 : $(OBJECTS) $(RGB_LIBRARY) liblo
 	$(CXX) $(CXXFLAGS) $(OBJECTS) -o $@ $(LDFLAGS)
 
 $(RGB_LIBRARY): FORCE
 	$(MAKE) -C $(RGB_LIBDIR)
+
+liblo: FORCE
+	cd $(LIBLO_LIB_DISTRIBUTION) && ./autogen.sh
+	$(MAKE) -C $(LIBLO_LIB_DISTRIBUTION)
+	$(MAKE) -C $(LIBLO_LIB_DISTRIBUTION) install
 
 lc4.o : lc4.cc
 
@@ -26,6 +33,7 @@ lc4.o : lc4.cc
 clean:
 	rm -f $(OBJECTS) $(BINARIES)
 	$(MAKE) -C $(RGB_LIBDIR) clean
+	$(MAKE) -C $(LIBLO_LIB_DISTRIBUTION) clean
 
 FORCE:
 .PHONY: FORCE
