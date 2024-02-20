@@ -1,1 +1,1 @@
-# rtpmidi-to-led-control
+# osc-to-led-control
