@@ -23,6 +23,9 @@ using rgb_matrix::Canvas;
 
 int done = 0;
 int count = 0;
+int red = 0;
+int green = 0;
+int blue = 0;
 
 void error(int num, const char *m, const char *path);
 
@@ -33,6 +36,13 @@ int quit_handler(const char *path, const char *types, lo_arg ** argv,
 		int argc, lo_message data, void *user_data);
 
 int brightness_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data);
+
+int red_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data);
+int green_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data);
+int blue_handler(const char *path, const char *types, lo_arg ** argv,
 		int argc, lo_message data, void *user_data);
 
 volatile bool interrupt_received = false;
@@ -82,7 +92,11 @@ int main(int argc, char *argv[]) {
 
 	lo_server_thread_add_method(st, "/quit", "", quit_handler, NULL);
 
-	lo_server_thread_add_method(st, "/VOLUME_L", NULL, brightness_handler, canvas);
+	lo_server_thread_add_method(st, "/lc4/brightness", NULL, brightness_handler, canvas);
+	
+	lo_server_thread_add_method(st, "/lc4/red", NULL, red_handler, canvas);
+	lo_server_thread_add_method(st, "/lc4/green", NULL, green_handler, canvas);
+	lo_server_thread_add_method(st, "/lc4/blue", NULL, blue_handler, canvas);
 
 	lo_server_thread_start(st);
 
@@ -122,13 +136,29 @@ void error(int num, const char *msg, const char *path)
 }
 
 int brightness_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
-	float amount = argv[0]->f * 100.0;
-//	std::cout << "brightness_handler called\n";
-//	std::cout << amount << std::endl;
-	((RGBMatrix *)canvas)->SetBrightness(255);
-	int red = abs(sin(argv[0]->f) * 255);
-	int blue = abs(tan(argv[0]->f) * 255);
-	((RGBMatrix *)canvas)->Fill(red,rand() % 255 + 1, blue);
+	int amount = argv[0]->i;
+	((RGBMatrix *)canvas)->SetBrightness(amount);
+	return 0;
+}
+
+
+int red_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
+	red = argv[0]->i;
+	((RGBMatrix *)canvas)->Fill(red, green, blue);
+	return 0;
+}
+
+
+int green_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
+	green = argv[0]->i;
+	((RGBMatrix *)canvas)->Fill(red, green, blue);
+	return 0;
+}
+
+
+int blue_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
+	blue = argv[0]->i;
+	((RGBMatrix *)canvas)->Fill(red, green, blue);
 	return 0;
 }
 
