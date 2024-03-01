@@ -4,6 +4,23 @@
 #include <unistd.h>
 #endif
 
+#ifndef TARGET_UID
+#define TARGET_UID 0
+#endif
+
+#ifndef TARGET_GID
+#define TARGET_GID 0
+#endif
+
+#ifndef UID_MIN
+#define UID_MIN 500
+#endif
+
+#ifndef GID_MIN
+#define GID_MIN 500
+#endif
+
+#include <string.h>
 #include <sys/soundcard.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -31,15 +48,19 @@ using rgb_matrix::Canvas;
 #define FPS 120
 int done = 0;
 int count = 0;
+int brightness = 0;
 float red = 0.0;
 float green = 0.0;
 float blue = 0.0;
+int panelWidth = 64;
+int panelHeight = 64;
 
 int device;
 drmModeModeInfo mode;
 struct gbm_device *gbmDevice;
 struct gbm_surface *gbmSurface;
 drmModeCrtc *crtc;
+RGBMatrix * canvas;
 uint32_t connectorId;
 
 void error(int num, const char *m, const char *path);
@@ -266,6 +287,37 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+   
+   uid_t ruid, euid, suid;
+   gid_t rgid, egid, sgid;
+   int uerr, gerr, fd;
+
+   if (getresuid(&ruid, &euid, &suid) == -1) {
+      fprintf(stderr, "Cannot obtain user identity: %m.\n");
+      return EXIT_FAILURE;
+   }
+   if (getresgid(&rgid, &egid, &sgid) == -1) {
+      fprintf(stderr, "Cannot obtain group identity: %m.\n");
+      return EXIT_FAILURE;
+   }
+   if (ruid != (uid_t)TARGET_UID && ruid < (uid_t)UID_MIN) {
+      fprintf(stderr, "Invalid user.\n");
+      return EXIT_FAILURE;
+   }
+   if ((rgid != (gid_t)TARGET_UID) && rgid < (gid_t)GID_MIN) {
+      fprintf(stderr, "Invalid group.\n");
+      return EXIT_FAILURE;
+   }
+
+   if (seteuid((uid_t)TARGET_UID) == -1) {
+      fprintf(stderr, "Insufficient user privileges.\n");
+      return EXIT_FAILURE;
+   }
+   
+   if (setegid((gid_t)TARGET_GID) == -1) {
+      fprintf(stderr, "Insufficient group privileges.\n");
+      return EXIT_FAILURE;
+   }
 
 	RGBMatrix::Options defaults;
 	defaults.hardware_mapping = "adafruit-hat";
@@ -273,9 +325,29 @@ int main(int argc, char *argv[]) {
 	defaults.chain_length = 2;
 	defaults.parallel = 1;
 	defaults.show_refresh_rate = false;
-	RGBMatrix *canvas = RGBMatrix::CreateFromFlags(&argc, &argv, &defaults);
+	canvas = RGBMatrix::CreateFromFlags(&argc, &argv, &defaults);
 	if (canvas == NULL)
 		return 1;
+   
+//   gerr = 0;
+//   if (setresgid(rgid, rgid, rgid) == -1) {
+//      gerr = errno;
+//      if (!gerr)
+//         gerr = EINVAL;
+//   }
+//   uerr = 0;
+//   if (setresuid(ruid, ruid, ruid) == -1) {
+//      uerr = errno;
+//      if (!uerr)
+//         uerr = EINVAL;
+//   }
+//   if (uerr || gerr) {
+//      if (uerr)
+//         fprintf(stderr, "Cannot drop user privileges: %s.\n", strerror(uerr));
+//      if (gerr)
+//         fprintf(stderr, "Cannot drop group privileges: %s.\n", strerror(gerr));
+//      return EXIT_FAILURE;
+//   }
 
 	signal(SIGTERM, InterruptHandler);
 	signal(SIGINT, InterruptHandler);
@@ -292,8 +364,6 @@ int main(int argc, char *argv[]) {
       }
    }
    
-   int panelWidth = 64;
-   int panelHeight = 64;
 
    int major, minor;
    GLuint program, vert, frag, vbo;
@@ -410,6 +480,15 @@ int main(int argc, char *argv[]) {
    posLoc = glGetAttribLocation(program, "pos");
    colorLoc = glGetUniformLocation(program, "color");
 
+//   if (seteuid((uid_t)TARGET_UID) == -1) {
+//      fprintf(stderr, "Insufficient user privileges.\n");
+//      return EXIT_FAILURE;
+//   }
+//   
+//   if (setegid((gid_t)TARGET_GID) == -1) {
+//      fprintf(stderr, "Insufficient group privileges.\n");
+//      return EXIT_FAILURE;
+//   }
 
 	lo_server_thread_add_method(st, "/quit", "", quit_handler, NULL);
 
@@ -433,18 +512,19 @@ int main(int argc, char *argv[]) {
 		//exit(1);
 	//}
    
-   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-   glUniform4f(colorLoc, 1.0f, 0.0f, 0.5f, 1.0f);
 	
    // Setting Vertex data
    glEnableVertexAttribArray(posLoc);
    glBindBuffer(GL_ARRAY_BUFFER, vbo);
    glVertexAttribPointer(posLoc, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
-   unsigned char *buffer = (unsigned char *)malloc(panelWidth * panelHeight * 3); 
+   std::cout << colorLoc << std::endl;
+   glUniform4f(colorLoc, 0.0f, 0.0f, 1.0f, 1.0f);
+   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
    while(!interrupt_received) {
-
-
+      unsigned char *buffer = (unsigned char *)malloc(panelWidth * panelHeight * 3); 
+      
+      glUseProgram(program);
 //		read(seqfd, &inpacket, sizeof(inpacket));
 //		if (inpacket[0] == MIDI_NOTEON) {
 //			DrawOnCanvas(canvas, inpacket[1], inpacket[2]);
@@ -453,13 +533,14 @@ int main(int argc, char *argv[]) {
 //		}
       struct timespec start;
       timespec_get(&start, TIME_UTC);
+      glUniform4f((colorLoc), red, green, blue, 1.0f);
        
       glDrawArrays(GL_TRIANGLES, 0, 3);
       
       // Create buffer to hold entire front buffer pixels
 
       glReadPixels(0, 0, panelWidth, panelHeight, GL_RGB, GL_UNSIGNED_BYTE, buffer);
-      
+      canvas->SetBrightness(brightness); 
       for (int y = 0; y < canvas->height(); y++) {
          for (int x = 0; x < canvas->width(); x++) {
             uint8_t *p = &buffer[(y * canvas->width() + x) * 3];
@@ -474,10 +555,9 @@ int main(int argc, char *argv[]) {
       if (tudiff < 10000001 / FPS) {
          usleep(10000001 / FPS - tudiff);
       }
-      
+      free(buffer);
 	}
 
-   free(buffer);
      
    eglDestroyContext(display, context);
    eglDestroySurface(display, surface);
@@ -498,17 +578,17 @@ void error(int num, const char *msg, const char *path)
 }
 
 int brightness_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
-	int amount = argv[0]->i;
-   //std::cout << "brightness_handler called: " << amount << std::endl;
-	((RGBMatrix *)canvas)->SetBrightness(amount);
+	brightness = argv[0]->i;
+   std::cout << "brightness_handler called: " << brightness << std::endl;
+	((RGBMatrix *)canvas)->SetBrightness(brightness);
 	return 0;
 }
 
 
 int red_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	red = (float) argv[0]->i;
+	red = argv[0]->f;
 	red /= 255.0;
-   //std::cout << "red_handler called: " << red << std::endl;
+   //std::cout << "red_handler called: " << *((GLint *)colorLoc) << std::endl;
    glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
 	return 0;
 }
