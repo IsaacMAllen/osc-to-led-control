@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include "led-matrix.h"
 #include <time.h>
-
+#include "stb_image.h"
 
 using rgb_matrix::RGBMatrix;
 using rgb_matrix::Canvas;

@@ -34,18 +34,26 @@
 #include <xf86drmMode.h>
 #include <gbm.h>
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include "led-matrix.h"
 #include <time.h>
-
+#include "shader.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <chrono>
+#include <time.h>
+#include <sys/time.h>
 
 using rgb_matrix::RGBMatrix;
 using rgb_matrix::Canvas;
 
 #define MIDI_DEVICE "/dev/sequencer"
-#define FPS 120
+#define FPS 160
 int done = 0;
 int count = 0;
 int brightness = 0;
@@ -54,6 +62,7 @@ float green = 0.0;
 float blue = 0.0;
 int panelWidth = 64;
 int panelHeight = 64;
+float rotation = 0;
 
 int device;
 drmModeModeInfo mode;
@@ -80,6 +89,9 @@ int green_handler(const char *path, const char *types, lo_arg ** argv,
 		int argc, lo_message data, void *colorLoc);
 int blue_handler(const char *path, const char *types, lo_arg ** argv,
 		int argc, lo_message data, void *colorLoc);
+int rotate_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data);
+
 
 volatile bool interrupt_received = false;
 static void InterruptHandler(int signo) {
@@ -198,24 +210,11 @@ static const EGLint configAttribs[] = {
 };
 
 static const EGLint contextAttribs[] = {
-   EGL_CONTEXT_CLIENT_VERSION, 2,
+   EGL_CONTEXT_MAJOR_VERSION, 3,
+   EGL_CONTEXT_MINOR_VERSION, 0,
+   //EGL_CONTEXT_CLIENT_VERSION, 2,
    EGL_NONE
 };
-
-// The following array holds vec3 data of 3 vertex positions
-static const GLfloat vertices[] = {
-   -1.0f, -1.0f, 0.0f,
-   1.0f, -1.0f, 0.0f,
-   0.0f, 1.0f, 0.0f
-};
-
-// The following are GLSL shaders for rendering a triangle on the screen
-#define STRINGIFY(x) #x
-static const char *vertexShaderCode = STRINGIFY(
-   attribute vec3 pos; void main() { gl_Position = vec4(pos, 1.0); });
-
-static const char *fragmentShaderCode =
-   STRINGIFY(uniform vec4 color; void main() { gl_FragColor = vec4(color);  });
 
 // Get the EGL error back as a string. Useful for debugging.
 static const char *eglGetErrorStr() {
@@ -287,7 +286,6 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-   
    uid_t ruid, euid, suid;
    gid_t rgid, egid, sgid;
    int uerr, gerr, fd;
@@ -366,8 +364,8 @@ int main(int argc, char *argv[]) {
    
 
    int major, minor;
-   GLuint program, vert, frag, vbo;
-   GLint posLoc, colorLoc, result;
+   GLuint program, vert, frag, vbo, vao, ebo;
+   GLint posLoc, texLoc, result;
 
    if (eglInitialize(display, &major, &minor) == EGL_FALSE) {
       fprintf(stderr, "Failed to get EGL version! Error: %s\n",
@@ -445,41 +443,6 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
    }
 
-   // Create a shader program
-   program = glCreateProgram();
-   glUseProgram(program);
-   vert = glCreateShader(GL_VERTEX_SHADER);
-   glShaderSource(vert, 1, &vertexShaderCode, NULL);
-   glCompileShader(vert);
-   GLint success;
-   char infoLog[512];
-   glGetShaderiv(vert, GL_COMPILE_STATUS, &success);
-   if (!success) {
-      glGetShaderInfoLog(vert, 512, NULL, infoLog);
-      std::cout << "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n" << infoLog << std::endl;
-   }
-   frag = glCreateShader(GL_FRAGMENT_SHADER);
-   glShaderSource(frag, 1, &fragmentShaderCode, NULL);
-   glCompileShader(frag);
-   glGetShaderiv(frag, GL_COMPILE_STATUS, &success);
-   if (!success) {
-      glGetShaderInfoLog(frag, 512, NULL, infoLog);
-      std::cout << "ERROR::SHADER::FRAG::COMPILATION_FAILED\n" << infoLog << std::endl;
-   }
-   glAttachShader(program, frag);
-   glAttachShader(program, vert);
-   glLinkProgram(program);
-   glUseProgram(program);
-
-   // Create VBO
-   glGenBuffers(1, &vbo);
-   glBindBuffer(GL_ARRAY_BUFFER, vbo);
-   glBufferData(GL_ARRAY_BUFFER, 9 * sizeof(float), vertices, GL_STATIC_DRAW);
-
-   // Get vertex attribute and uniform locations
-   posLoc = glGetAttribLocation(program, "pos");
-   colorLoc = glGetUniformLocation(program, "color");
-
 //   if (seteuid((uid_t)TARGET_UID) == -1) {
 //      fprintf(stderr, "Insufficient user privileges.\n");
 //      return EXIT_FAILURE;
@@ -493,10 +456,12 @@ int main(int argc, char *argv[]) {
 	lo_server_thread_add_method(st, "/quit", "", quit_handler, NULL);
 
 	lo_server_thread_add_method(st, "/lc4/brightness", NULL, brightness_handler, canvas);
+
+   lo_server_thread_add_method(st, "/lc4/rotate", NULL, rotate_handler, NULL);
 	
-	lo_server_thread_add_method(st, "/lc4/red", NULL, red_handler, &colorLoc);
-	lo_server_thread_add_method(st, "/lc4/green", NULL, green_handler, &colorLoc);
-	lo_server_thread_add_method(st, "/lc4/blue", NULL, blue_handler, &colorLoc);
+	//lo_server_thread_add_method(st, "/lc4/red", NULL, red_handler, &colorLoc);
+	//lo_server_thread_add_method(st, "/lc4/green", NULL, green_handler, &colorLoc);
+	//lo_server_thread_add_method(st, "/lc4/blue", NULL, blue_handler, &colorLoc);
 
 	lo_server_thread_start(st);
 
@@ -512,19 +477,86 @@ int main(int argc, char *argv[]) {
 		//exit(1);
 	//}
    
-	
-   // Setting Vertex data
-   glEnableVertexAttribArray(posLoc);
+   Shader shader("texture.vs", "texture.fs");
+
+   float vertices[] = {
+    // positions          // colors           // texture coords
+     0.5f,  0.5f, 0.0f,   1.0f, 0.0f, 0.0f,   1.0f, 1.0f,   // top right
+     0.5f, -0.5f, 0.0f,   0.0f, 1.0f, 0.0f,   1.0f, 0.0f,   // bottom right
+    -0.5f, -0.5f, 0.0f,   0.0f, 0.0f, 1.0f,   0.0f, 0.0f,   // bottom left
+    -0.5f,  0.5f, 0.0f,   1.0f, 1.0f, 0.0f,   0.0f, 1.0f    // top left 
+   };
+    unsigned int indices[] = {  
+        0, 1, 3, // first triangle
+        1, 2, 3  // second triangle
+    };
+    // Create VBO
+   glGenVertexArrays(1, &vao);
+   glGenBuffers(1, &vbo);
+   glGenBuffers(1, &ebo);
+
+   glBindVertexArray(vao);
+
    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-   glVertexAttribPointer(posLoc, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void *)0);
-   std::cout << colorLoc << std::endl;
-   glUniform4f(colorLoc, 0.0f, 0.0f, 1.0f, 1.0f);
-   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+   glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+   glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+
+   // Get vertex attribute and uniform locations
+   //posLoc = glGetAttribLocation(program, "aPos");
+   //texLoc = glGetAttribLocation(program, "aTexCoord");
+   
+
+    // position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    // texture coord attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+   
+   // load and create a texture 
+    // -------------------------
+    unsigned int texture;
+    // texture
+    // ---------
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture); 
+     // set the texture wrapping parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	// set texture wrapping to GL_REPEAT (default wrapping method)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    // set texture filtering parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // load image, create texture and generate mipmaps
+    int width, height, nrChannels;
+    //stbi_set_flip_vertically_on_load(true); // tell stb_image.h to flip loaded texture's on the y-axis.
+    // The FileSystem::getPath(...) is part of the GitHub repository so we can find files on any IDE/platform; replace it with your own image path.
+    unsigned char *data = stbi_load("./resources/textures/awesomeface.png", &width, &height, &nrChannels, 0);
+    if (data)
+    {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        std::cout << "Loaded Container\n";
+    }
+    else
+    {
+        std::cout << "Failed to load texture" << std::endl;
+    }
+    stbi_image_free(data);
+
+
+   //glUniform4f(colorLoc, 0.0f, 0.0f, 1.0f, 1.0f);
+   //glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+   //glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+   unsigned char *buffer = (unsigned char *)malloc(panelWidth * panelHeight * 3);
+   std::chrono::time_point<std::chrono::steady_clock> startClock = std::chrono::steady_clock::now();    
+   canvas->SetBrightness(brightness);
    while(!interrupt_received) {
-      unsigned char *buffer = (unsigned char *)malloc(panelWidth * panelHeight * 3); 
       
-      glUseProgram(program);
 //		read(seqfd, &inpacket, sizeof(inpacket));
 //		if (inpacket[0] == MIDI_NOTEON) {
 //			DrawOnCanvas(canvas, inpacket[1], inpacket[2]);
@@ -533,14 +565,31 @@ int main(int argc, char *argv[]) {
 //		}
       struct timespec start;
       timespec_get(&start, TIME_UTC);
-      glUniform4f((colorLoc), red, green, blue, 1.0f);
-       
-      glDrawArrays(GL_TRIANGLES, 0, 3);
+      glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+      //glUniform4f((colorLoc), red, green, blue, 1.0f);
+
+      // bind textures on corresponding texture units
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, texture);
+
+      // create transformations
+      glm::mat4 transform = glm::mat4(1.0f); // make sure to initialize matrix to identity matrix first
+      transform = glm::translate(transform, glm::vec3(0.0f, 0.0f, 0.0f));
+      transform = glm::rotate(transform, rotation, glm::vec3(0.0f, 0.0f, 1.0f));
+
+      // get matrix's uniform location and set matrix
+      shader.use();
+      unsigned int transformLoc = glGetUniformLocation(shader.ID, "transform");
+      glUniformMatrix4fv(transformLoc, 1, GL_FALSE, glm::value_ptr(transform));
+
+      glBindVertexArray(vao);
+      glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
       
       // Create buffer to hold entire front buffer pixels
 
       glReadPixels(0, 0, panelWidth, panelHeight, GL_RGB, GL_UNSIGNED_BYTE, buffer);
-      canvas->SetBrightness(brightness); 
+       
       for (int y = 0; y < canvas->height(); y++) {
          for (int x = 0; x < canvas->width(); x++) {
             uint8_t *p = &buffer[(y * canvas->width() + x) * 3];
@@ -555,10 +604,11 @@ int main(int argc, char *argv[]) {
       if (tudiff < 10000001 / FPS) {
          usleep(10000001 / FPS - tudiff);
       }
-      free(buffer);
 	}
-
-     
+   free(buffer);
+   glDeleteVertexArrays(1, &vao);
+   glDeleteBuffers(1, &vbo);
+   glDeleteBuffers(1, &ebo);  
    eglDestroyContext(display, context);
    eglDestroySurface(display, surface);
    eglTerminate(display);
@@ -578,12 +628,17 @@ void error(int num, const char *msg, const char *path)
 }
 
 int brightness_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
-	brightness = argv[0]->i;
+	brightness = argv[0]->f;
    std::cout << "brightness_handler called: " << brightness << std::endl;
 	((RGBMatrix *)canvas)->SetBrightness(brightness);
 	return 0;
 }
 
+int rotate_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data) {
+         rotation = argv[0]->f;
+         return 0;
+      }
 
 int red_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
 	red = argv[0]->f;
