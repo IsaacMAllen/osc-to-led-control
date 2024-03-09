@@ -1,1 +1,1 @@
-# osc-to-led-control
+# OSCGLED
