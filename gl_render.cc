@@ -20,16 +20,17 @@
 #define GID_MIN 500
 #endif
 
+#include <vector>
+#include <termios.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/soundcard.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <lo/lo.h>
 #include <lo/lo_cpp.h>
-#include <cmath>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <gbm.h>
@@ -39,31 +40,52 @@
 #include <unistd.h>
 #include "led-matrix.h"
 #include <time.h>
-#include "shader.h"
+#include "shadergl.h"
+#include <raylib.h>
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+//#include "stb_image.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <chrono>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/inotify.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <complex.h>
+#include <fftw3.h>
+#include <math.h>
+#include <cmath>
 
 using rgb_matrix::RGBMatrix;
 using rgb_matrix::Canvas;
+using namespace std::complex_literals;
 
 #define MIDI_DEVICE "/dev/sequencer"
+#define BUF_LEN (10 * (sizeof(struct inotify_event) + NAME_MAX + 1))
 #define FPS 160
+typedef struct {
+   float left;
+   float right;
+}Frame;
+
+Frame global_frames[4080] = {0};
+size_t global_frames_count = 0;
 int done = 0;
 int count = 0;
+int serial_port;
 int brightness = 0;
 float red = 0.0;
 float green = 0.0;
 float blue = 0.0;
+float white = 0.0;
 int panelWidth = 64;
 int panelHeight = 64;
-float rotation = 0;
-
+float exponent = 0.0;
+float x = 0.5;
+float y = 0.5;
+int shader = 1;
 int device;
 drmModeModeInfo mode;
 struct gbm_device *gbmDevice;
@@ -71,6 +93,7 @@ struct gbm_surface *gbmSurface;
 drmModeCrtc *crtc;
 RGBMatrix * canvas;
 uint32_t connectorId;
+
 
 void error(int num, const char *m, const char *path);
 
@@ -89,13 +112,73 @@ int green_handler(const char *path, const char *types, lo_arg ** argv,
 		int argc, lo_message data, void *colorLoc);
 int blue_handler(const char *path, const char *types, lo_arg ** argv,
 		int argc, lo_message data, void *colorLoc);
-int rotate_handler(const char *path, const char *types, lo_arg ** argv,
+int white_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *colorLoc);
+int clear_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *colorLoc);
+int exponent_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data);
+int x_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data);
+int y_handler(const char *path, const char *types, lo_arg ** argv,
+		int argc, lo_message data, void *user_data);
+int shader_handler(const char *path, const char *types, lo_arg ** argv,
 		int argc, lo_message data, void *user_data);
 
 
 volatile bool interrupt_received = false;
 static void InterruptHandler(int signo) {
 	interrupt_received = true;
+}
+
+//   for (size_t f = 0; f < n; ++f) {
+//      out[f] = 0;
+//      for (size_t i = 0; i < n; i++) {
+//         double t = (double)i/n;
+//         out[f] += in[i]*std::exp(std::complex<double>(2 * pi * f * t) * 1i);
+//      }
+//      out[f] = 0;
+//      for (size_t i = 0; i < n; ++i) {
+//         double t = (double)i/n;
+//         out[f] += in[i]*std::exp(std::complex<double>(2 * pi * f * t) * 1i);
+//      } 
+//   }
+   
+
+#define ARRAY_LEN(xs) sizeof(xs)/sizeof(xs[0])
+
+void fft(double in[], size_t stride, std::complex<double> out[], size_t n) {
+   assert(n > 0);
+
+   if (n == 1) {
+      out[0] = in[0];
+      return;
+   }
+
+   fft(in, stride*2, out, n/2);
+   fft(in + stride, stride*2, out + n/2, n/2);
+
+   for (size_t k = 0; k < n/2; ++k) {
+      double t = (double)k/n;
+      std::complex<double> v = std::exp(std::complex<double>(-2*M_PI*t) * 1i) * out[k + n/2];
+      std::complex<double> e = out[k];
+      out[k] = e + v;
+      out[k + n/2] = e - v;
+   }
+}
+
+void audioCallback(void *bufferData, unsigned int frames) {
+   size_t capacity = ARRAY_LEN(global_frames);
+   if (frames <= capacity - global_frames_count) {
+      memcpy(global_frames + global_frames_count, bufferData, sizeof(Frame)*frames);
+      global_frames_count += frames;
+   } else if(frames <= capacity) {
+      memmove(global_frames, global_frames + frames, sizeof(Frame)*(capacity - frames));
+      memcpy(global_frames + (capacity - frames), bufferData, sizeof(Frame)*frames);
+   } else {
+      memcpy(global_frames, bufferData, sizeof(Frame)*capacity);
+      global_frames_count = capacity;
+   }
 }
 
 static drmModeConnector *getConnector(drmModeRes *resources) {
@@ -277,7 +360,72 @@ static void DrawOnCanvas(RGBMatrix *canvas, uint8_t note, uint8_t velocity) {
 }
 
 int main(int argc, char *argv[]) {
+   size_t n = 64;
+   //double in[n];
+   //std::complex<double> out[n];
+   fftw_complex *in, *out;
+   fftw_plan p;
+   in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * n);
+   out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * n);
+   p = fftw_plan_dft_1d(n, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+   for (size_t i = 0; i < n; ++i) {
+      double t = (double)i/n;
+      in[i][0] = cos(2*M_PI*t*1) + sin(2*M_PI*t*2) + cos(2*M_PI*t*3);
+      in[i][1] = 0.0;
+   }
+   fftw_execute(p);
+   //fft(in, 1, out, n);
+   for (size_t f = 0; f < n; ++f) {
+      //printf("%02zu: %.2f, %.2f\n", f, real(out[f]), imag(out[f]));
+      printf("%02zu: %.2f, %.2f\n", f, out[f][0], out[f][1]);
+   }
 
+   serial_port = open("/dev/ttyACM0", O_RDWR);
+   if (serial_port < 0) {
+      serial_port = open("/dev/ttyACM1", O_RDWR);
+      if (serial_port < 0) {
+         printf("Error %i from open: %s\n", errno, strerror(errno));
+      }
+   }
+   struct termios tty;
+   if (tcgetattr(serial_port, &tty) != 0) {
+      printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
+   }
+   InitAudioDevice();
+   Music music = LoadMusicStream("ecstasy.mp3");
+   assert(music.stream.sampleSize == 32);
+   assert(music.stream.channels == 2); 
+   printf("music.frameCount = %u\n", music.frameCount);
+   printf("music.stream.sampleRate = %u\n", music.stream.sampleRate);
+   printf("music.stream.sampleSize = %u\n", music.stream.sampleSize);
+   printf("music.stream.channels = %u\n", music.stream.channels);
+   
+   tty.c_cflag &= ~PARENB; // Clear parity bit, disabling parity (most common)
+   tty.c_cflag &= ~CSTOPB; // Clear stop field, only one stop bit used in communication (most common)
+   tty.c_cflag &= ~CSIZE; // Clear all the size bits, then use one of the statements below
+   tty.c_cflag |= CS8; // 8 bits per byte (most common)
+   tty.c_cflag &= ~CRTSCTS; // Disable RTS/CTS hardware flow control (most common)
+   tty.c_cflag |= CREAD | CLOCAL; // Turn on READ & ignore ctrl lines (CLOCAL = 1)
+   tty.c_lflag &= ~ICANON;
+   tty.c_lflag &= ~ECHO; // Disable echo
+   tty.c_lflag &= ~ECHOE; // Disable erasure
+   tty.c_lflag &= ~ECHONL; // Disable new-line echo
+   tty.c_lflag &= ~ISIG; // Disable interpretation of INTR, QUIT and SUSP
+   tty.c_iflag &= ~(IXON | IXOFF | IXANY); // Turn off s/w flow ctrl
+   tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL); // Disable any special handling of received bytes
+   tty.c_oflag &= ~OPOST; // Prevent special interpretation of output bytes (e.g. newline chars)
+   tty.c_oflag &= ~ONLCR; // Prevent conversion of newline to carriage return/line feed   
+   tty.c_cc[VTIME] = 10;    // Wait for up to 1s (10 deciseconds), returning as soon as any data is received.
+   tty.c_cc[VMIN] = 0;
+
+   // Set in/out baud rate to be 115200
+   cfsetispeed(&tty, B115200);
+   cfsetospeed(&tty, B115200);
+
+   // Save tty settings, also checking for error
+   if (tcsetattr(serial_port, TCSANOW, &tty) != 0) {
+       printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
+   }
 	const char *port = "9000";
 
 	lo_server_thread st = lo_server_thread_new_with_proto(port, LO_UDP, error);
@@ -457,11 +605,18 @@ int main(int argc, char *argv[]) {
 
 	lo_server_thread_add_method(st, "/lc4/brightness", NULL, brightness_handler, canvas);
 
-   lo_server_thread_add_method(st, "/lc4/rotate", NULL, rotate_handler, NULL);
+   lo_server_thread_add_method(st, "/lc4/exponent", NULL, exponent_handler, NULL);
 	
-	//lo_server_thread_add_method(st, "/lc4/red", NULL, red_handler, &colorLoc);
-	//lo_server_thread_add_method(st, "/lc4/green", NULL, green_handler, &colorLoc);
-	//lo_server_thread_add_method(st, "/lc4/blue", NULL, blue_handler, &colorLoc);
+   lo_server_thread_add_method(st, "/lc4/x", NULL, x_handler, NULL);
+   lo_server_thread_add_method(st, "/lc4/y", NULL, y_handler, NULL);
+
+   lo_server_thread_add_method(st, "/lc4/shader", NULL, shader_handler, NULL);
+
+	lo_server_thread_add_method(st, "/lc4/red", NULL, red_handler, NULL);
+	lo_server_thread_add_method(st, "/lc4/green", NULL, green_handler, NULL);
+	lo_server_thread_add_method(st, "/lc4/blue", NULL, blue_handler, NULL);
+	lo_server_thread_add_method(st, "/lc4/white", NULL, white_handler, NULL);
+	lo_server_thread_add_method(st, "/lc4/clear", NULL, clear_handler, NULL);
 
 	lo_server_thread_start(st);
 
@@ -477,31 +632,41 @@ int main(int argc, char *argv[]) {
 		//exit(1);
 	//}
    
-   Shader shader("texture.vs", "texture.fs");
+   glEnable(GL_DEPTH_TEST); 
+   
+   
 
    float vertices[] = {
-    // positions          // colors           // texture coords
-     0.5f,  0.5f, 0.0f,   1.0f, 0.0f, 0.0f,   1.0f, 1.0f,   // top right
-     0.5f, -0.5f, 0.0f,   0.0f, 1.0f, 0.0f,   1.0f, 0.0f,   // bottom right
-    -0.5f, -0.5f, 0.0f,   0.0f, 0.0f, 1.0f,   0.0f, 0.0f,   // bottom left
-    -0.5f,  0.5f, 0.0f,   1.0f, 1.0f, 0.0f,   0.0f, 1.0f    // top left 
-   };
-    unsigned int indices[] = {  
-        0, 1, 3, // first triangle
-        1, 2, 3  // second triangle
-    };
+    // first triangle
+     1.0f,  1.0f, 0.0f,  // top right
+     1.0f, -1.0f, 0.0f,  // bottom right
+    -1.0f, -1.0f, 0.0f,  // bottom left
+    // second triangle
+    -1.0f,  1.0f, 0.0f,   // top left
+    -1.0f, -1.0f, 0.0f,  // bottom left
+     1.0f,  1.0f, 0.0f,  // top right
+     
+    
+    
+}; 
+
+   unsigned int indices[] = {  // note that we start from 0!
+      2, 3, 0,   // first triangle
+      0, 1, 2    // second triangle
+   };  
+
     // Create VBO
    glGenVertexArrays(1, &vao);
    glGenBuffers(1, &vbo);
-   glGenBuffers(1, &ebo);
+
+   //glGenBuffers(1, &ebo);
 
    glBindVertexArray(vao);
+   //glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+   //glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 
    glBindBuffer(GL_ARRAY_BUFFER, vbo);
    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
-   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-   glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 
    // Get vertex attribute and uniform locations
    //posLoc = glGetAttribLocation(program, "aPos");
@@ -509,45 +674,38 @@ int main(int argc, char *argv[]) {
    
 
     // position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
-    // texture coord attribute
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
    
    // load and create a texture 
     // -------------------------
-    unsigned int texture;
-    // texture
-    // ---------
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture); 
-     // set the texture wrapping parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	// set texture wrapping to GL_REPEAT (default wrapping method)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    // set texture filtering parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   //  unsigned int texture;
+   //  // texture
+   //  // ---------
+   //  glGenTextures(1, &texture);
+   //  glBindTexture(GL_TEXTURE_2D, texture); 
+   //   // set the texture wrapping parameters
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	// set texture wrapping to GL_REPEAT (default wrapping method)
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+   //  // set texture filtering parameters
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     // load image, create texture and generate mipmaps
-    int width, height, nrChannels;
+   //  int width, height, nrChannels;
     //stbi_set_flip_vertically_on_load(true); // tell stb_image.h to flip loaded texture's on the y-axis.
     // The FileSystem::getPath(...) is part of the GitHub repository so we can find files on any IDE/platform; replace it with your own image path.
-    unsigned char *data = stbi_load("./resources/textures/awesomeface.png", &width, &height, &nrChannels, 0);
-    if (data)
-    {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
-        std::cout << "Loaded Container\n";
-    }
-    else
-    {
-        std::cout << "Failed to load texture" << std::endl;
-    }
-    stbi_image_free(data);
-
+   //  unsigned char *data = stbi_load("./resources/textures/awesomeface.png", &width, &height, &nrChannels, 0);
+   //  if (data)
+   //  {
+   //      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+   //      glGenerateMipmap(GL_TEXTURE_2D);
+   //      std::cout << "Loaded Container\n";
+   //  }
+   //  else
+   //  {
+   //      std::cout << "Failed to load texture" << std::endl;
+   //  }
+   //  stbi_image_free(data);
 
    //glUniform4f(colorLoc, 0.0f, 0.0f, 1.0f, 1.0f);
    //glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -555,7 +713,40 @@ int main(int argc, char *argv[]) {
    unsigned char *buffer = (unsigned char *)malloc(panelWidth * panelHeight * 3);
    std::chrono::time_point<std::chrono::steady_clock> startClock = std::chrono::steady_clock::now();    
    canvas->SetBrightness(brightness);
+   int inotifyFd, wd;
+   
+   inotifyFd = inotify_init();
+   if (inotifyFd == -1) {
+      exit(1);
+   }
+
+   int flags = fcntl(inotifyFd, F_GETFL);
+   if (fcntl(inotifyFd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        fprintf(stderr, "fcntl(F_SETFL)");
+   }
+   wd = inotify_add_watch(inotifyFd, "fence4.frag", IN_MODIFY);
+   if (wd == -1) {
+            fprintf(stderr, "inotify_add_watch");
+   }
+   struct inotify_event *event = NULL;
+   bool first = true;
+   ShaderGL shader1("texture.vs", "fence1.frag");
+   ShaderGL shader2("texture.vs", "fence2.frag");
+   ShaderGL shader3("texture.vs", "fence3.frag");
+   ShaderGL shader4("texture.vs", "fence4.frag");
+   ShaderGL shader_render = shader1;
+   PlayMusicStream(music);
+   AttachAudioStreamProcessor(music.stream, audioCallback);
    while(!interrupt_received) {
+      UpdateMusicStream(music);
+      for (size_t i = 0; i < global_frames_count; ++i) {
+         float t = global_frames[i].left;
+         if (t > 0) {
+         } else {
+         }
+         //printf("%f\n", t);
+      }
+      //printf("\n");
       
 //		read(seqfd, &inpacket, sizeof(inpacket));
 //		if (inpacket[0] == MIDI_NOTEON) {
@@ -563,29 +754,64 @@ int main(int argc, char *argv[]) {
 //			//printf("Midi note: %d Velocity: %d\n", inpacket[1], inpacket[2]);
 //			usleep(1*1000);
 //		}
+      
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
       struct timespec start;
       timespec_get(&start, TIME_UTC);
       glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-      glClear(GL_COLOR_BUFFER_BIT);
-      //glUniform4f((colorLoc), red, green, blue, 1.0f);
-
-      // bind textures on corresponding texture units
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, texture);
-
-      // create transformations
-      glm::mat4 transform = glm::mat4(1.0f); // make sure to initialize matrix to identity matrix first
-      transform = glm::translate(transform, glm::vec3(0.0f, 0.0f, 0.0f));
-      transform = glm::rotate(transform, rotation, glm::vec3(0.0f, 0.0f, 1.0f));
-
-      // get matrix's uniform location and set matrix
-      shader.use();
-      unsigned int transformLoc = glGetUniformLocation(shader.ID, "transform");
-      glUniformMatrix4fv(transformLoc, 1, GL_FALSE, glm::value_ptr(transform));
-
-      glBindVertexArray(vao);
-      glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+      std::chrono::time_point<std::chrono::steady_clock> endClock = std::chrono::steady_clock::now();
       
+      std::chrono::steady_clock::duration time_span = endClock - startClock; 
+      float nseconds = float(time_span.count()) * std::chrono::steady_clock::period::num / std::chrono::steady_clock::period::den;
+      // get matrix's uniform location and set matrix
+      switch (shader) {
+         case 1:
+            shader_render = shader1;
+            break;
+         case 2:
+            shader_render = shader2;
+            break;
+         case 3:
+            shader_render = shader3;
+            shader_render.setFloat("u_exponent", exponent);
+            break;
+         case 4:
+            shader_render = shader4;
+            shader_render.setFloat("u_exponent", exponent);
+            break;
+      }
+      char buf[BUF_LEN] __attribute__((aligned(8)));
+      int n = read(inotifyFd, buf, BUF_LEN);
+      char* p = buf;
+      
+      if(p < buf + n) {
+         event = (struct inotify_event*)p;
+         uint32_t mask = event->mask;
+         if (mask & IN_MODIFY && !first) {
+            first = true;
+            ShaderGL newShader("texture.vs", "fence4.frag");
+            shader_render = newShader;
+            shader4 = newShader;
+            shader = 4;
+            // printf("File has been modified\n");
+            // std::ifstream f("fence4.frag");
+            // if (f.is_open()) {
+            //    std::cout << f.rdbuf();
+            //    f.seekg(0);
+            // }
+         }
+         else {
+            first = false;
+         }
+      }
+      shader_render.use();
+      shader_render.setVec2("u_resolution", glm::vec2(64.0f, 64.0f));
+      shader_render.setFloat("u_time", nseconds);
+      shader_render.setFloat("u_x", x);
+      shader_render.setFloat("u_y", y);
+      glBindVertexArray(vao);
+      //glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+      glDrawArrays(GL_TRIANGLES, 0, 6);
       // Create buffer to hold entire front buffer pixels
 
       glReadPixels(0, 0, panelWidth, panelHeight, GL_RGB, GL_UNSIGNED_BYTE, buffer);
@@ -607,14 +833,14 @@ int main(int argc, char *argv[]) {
 	}
    free(buffer);
    glDeleteVertexArrays(1, &vao);
-   glDeleteBuffers(1, &vbo);
-   glDeleteBuffers(1, &ebo);  
+   glDeleteBuffers(1, &vbo); 
    eglDestroyContext(display, context);
    eglDestroySurface(display, surface);
    eglTerminate(display);
    gbmClean();
    close(device);
 	canvas->Clear();
+   close(serial_port);
 	delete canvas;
 	lo_server_thread_free(st);
 	return EXIT_SUCCESS;
@@ -629,38 +855,84 @@ void error(int num, const char *msg, const char *path)
 
 int brightness_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
 	brightness = argv[0]->f;
-   std::cout << "brightness_handler called: " << brightness << std::endl;
+   //std::cout << "brightness_handler called: " << brightness << std::endl;
 	((RGBMatrix *)canvas)->SetBrightness(brightness);
 	return 0;
 }
 
-int rotate_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data) {
-         rotation = argv[0]->f;
+int exponent_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
+         exponent = argv[0]->f;
+         //std::cout << "exponent_handler called: " << exponent << std::endl;
          return 0;
-      }
+}
+
+int x_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
+         x = argv[0]->f;
+         return 0;
+}
+
+int y_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
+         y = argv[0]->f;
+         return 0;
+}
+
+int shader_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
+         shader = argv[0]->f;
+         return 0;
+}
 
 int red_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
 	red = argv[0]->f;
-	red /= 255.0;
+   int redInt = static_cast<int>(red);
    //std::cout << "red_handler called: " << *((GLint *)colorLoc) << std::endl;
-   glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
-	return 0;
+   //glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
+   std::string msg = "r:" + std::to_string(redInt);
+   char r[5];
+   strncpy(r, msg.c_str(), sizeof(r));
+   //std::cout << msg << std::endl;
+   write(serial_port, r, msg.length());
+   return 0;
 }
 
 
 int green_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	green = (float) argv[0]->i;
-	green /= 255.0;
-   glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
+	green = argv[0]->f;
+   int greenInt = static_cast<int>(green);
+   std::string msg = "g:" + std::to_string(greenInt);
+   char g[5];
+   strncpy(g, msg.c_str(), sizeof(g));
+   //std::cout << msg << std::endl;
+	write(serial_port, g, msg.length());
 	return 0;
 }
 
 
 int blue_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	blue = (float) argv[0]->i;
-	blue /= 255.0;
-   glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
+	blue = argv[0]->f;
+   int blueInt = static_cast<int>(blue);
+   std::string msg = "b:" + std::to_string(blueInt);
+   char b[5];
+   strncpy(b, msg.c_str(), sizeof(b));
+   //std::cout << msg << std::endl;
+	write(serial_port, b, msg.length());
+	return 0;
+}
+
+int white_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
+	white = argv[0]->f;
+   int whiteInt = static_cast<int>(white);
+   std::string msg = "w:" + std::to_string(whiteInt);
+   char w[5];
+   strncpy(w, msg.c_str(), sizeof(w));
+   //std::cout << msg << std::endl;
+	write(serial_port, w, msg.length());
+	return 0;
+}
+
+int clear_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
+	unsigned char c[] = {'c'};
+   write(serial_port, c, 1);
+   //glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
 	return 0;
 }
 

@@ -1,3 +1,4 @@
 *.o
-lc4
+*lc4*
 bin/gl_render
+*.mp3
