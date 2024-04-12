@@ -57,6 +57,7 @@
 #include <fftw3.h>
 #include <math.h>
 #include <cmath>
+#include <portaudio.h>
 
 using rgb_matrix::RGBMatrix;
 using rgb_matrix::Canvas;
@@ -65,11 +66,31 @@ using namespace std::complex_literals;
 #define MIDI_DEVICE "/dev/sequencer"
 #define BUF_LEN (10 * (sizeof(struct inotify_event) + NAME_MAX + 1))
 #define FPS 160
+#define SAMPLE_RATE 48000.0
+#define FRAMES_PER_BUFFER 512
+#define NUM_CHANNELS 2
+#define SPECTRO_FREQ_START 20
+#define SPECTRO_FREQ_END 20000
+
+typedef struct {
+   double *in;
+   double *out;
+   fftw_plan p;
+   int startIndex;
+   int spectroSize;
+} streamCallbackData;
+
+static streamCallbackData* spectroData;
+//fftw_complex *in, *out;
+PaStream *stream;
+//float *in;
+//std::complex<float> *out;
+fftw_plan fftwPlan;
 typedef struct {
    float left;
    float right;
-}Frame;
-
+} Frame;
+double max_amp;
 Frame global_frames[4080] = {0};
 size_t global_frames_count = 0;
 int done = 0;
@@ -98,37 +119,37 @@ uint32_t connectorId;
 void error(int num, const char *m, const char *path);
 
 int echo_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data);
+      int argc, lo_message data, void *user_data);
 
 int quit_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data);
+      int argc, lo_message data, void *user_data);
 
 int brightness_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data);
+      int argc, lo_message data, void *user_data);
 
 int red_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *colorLoc);
+      int argc, lo_message data, void *colorLoc);
 int green_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *colorLoc);
+      int argc, lo_message data, void *colorLoc);
 int blue_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *colorLoc);
+      int argc, lo_message data, void *colorLoc);
 int white_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *colorLoc);
+      int argc, lo_message data, void *colorLoc);
 int clear_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *colorLoc);
+      int argc, lo_message data, void *colorLoc);
 int exponent_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data);
+      int argc, lo_message data, void *user_data);
 int x_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data);
+      int argc, lo_message data, void *user_data);
 int y_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data);
+      int argc, lo_message data, void *user_data);
 int shader_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data);
+      int argc, lo_message data, void *user_data);
 
 
 volatile bool interrupt_received = false;
 static void InterruptHandler(int signo) {
-	interrupt_received = true;
+   interrupt_received = true;
 }
 
 //   for (size_t f = 0; f < n; ++f) {
@@ -143,11 +164,11 @@ static void InterruptHandler(int signo) {
 //         out[f] += in[i]*std::exp(std::complex<double>(2 * pi * f * t) * 1i);
 //      } 
 //   }
-   
+
 
 #define ARRAY_LEN(xs) sizeof(xs)/sizeof(xs[0])
 
-void fft(double in[], size_t stride, std::complex<double> out[], size_t n) {
+void fft(float in[], size_t stride, std::complex<float> out[], size_t n) {
    assert(n > 0);
 
    if (n == 1) {
@@ -159,27 +180,37 @@ void fft(double in[], size_t stride, std::complex<double> out[], size_t n) {
    fft(in + stride, stride*2, out + n/2, n/2);
 
    for (size_t k = 0; k < n/2; ++k) {
-      double t = (double)k/n;
-      std::complex<double> v = std::exp(std::complex<double>(-2*M_PI*t) * 1i) * out[k + n/2];
-      std::complex<double> e = out[k];
+      float t = (float)k/n;
+      std::complex<float> v = std::exp(std::complex<float>(-2*M_PI*t) * std::complex<float>(1i)) * out[k + n/2];
+      std::complex<float> e = out[k];
       out[k] = e + v;
       out[k + n/2] = e - v;
    }
 }
 
-void audioCallback(void *bufferData, unsigned int frames) {
-   size_t capacity = ARRAY_LEN(global_frames);
-   if (frames <= capacity - global_frames_count) {
-      memcpy(global_frames + global_frames_count, bufferData, sizeof(Frame)*frames);
-      global_frames_count += frames;
-   } else if(frames <= capacity) {
-      memmove(global_frames, global_frames + frames, sizeof(Frame)*(capacity - frames));
-      memcpy(global_frames + (capacity - frames), bufferData, sizeof(Frame)*frames);
-   } else {
-      memcpy(global_frames, bufferData, sizeof(Frame)*capacity);
-      global_frames_count = capacity;
-   }
-}
+
+//void audioCallback(void *bufferData, unsigned int frames) {
+//   //   size_t capacity = ARRAY_LEN(global_frames);
+//   //   if (frames <= capacity - global_frames_count) {
+//   //      memcpy(global_frames + global_frames_count, bufferData, sizeof(Frame)*frames);
+//   //      global_frames_count += frames;
+//   //   } else if(frames <= capacity) {
+//   //      memmove(global_frames, global_frames + frames, sizeof(Frame)*(capacity - frames));
+//   //      memcpy(global_frames + (capacity - frames), bufferData, sizeof(Frame)*frames);
+//   //   } else {
+//   //      memcpy(global_frames, bufferData, sizeof(Frame)*capacity);
+//   //      global_frames_count = capacity;
+//   //   }
+//   //if (frames < N) return;
+//   Frame *fs = (Frame *)bufferData;
+//   for (size_t i = 0; i < frames; ++i) {
+//      //in[i][0] = fs[i].left;
+//      in[i] = fs[i].left;
+//      //in[i][1] = 0.0;
+//   }
+//   //fftw_execute(fftwPlan);
+//   fft(in, 1, out, N); 
+//}
 
 static drmModeConnector *getConnector(drmModeRes *resources) {
    for (int i = 0; i < resources -> count_connectors; i++) {
@@ -224,7 +255,7 @@ static int getDisplay(EGLDisplay *display) {
       drmModeFreeResources(resources);
       return -1;
    }
-   
+
    crtc = drmModeGetCrtc(device, encoder->crtc_id);
    drmModeFreeEncoder(encoder);
    drmModeFreeConnector(connector);
@@ -318,15 +349,15 @@ static const char *eglGetErrorStr() {
          return "An EGLConfig argument does not name a valid EGL frame buffer configuration.";
       case EGL_BAD_CURRENT_SURFACE:
          return "The current surface of the calling thread is a window, pixel "
-                  "buffer or pixmap that is no longer valid.";
+            "buffer or pixmap that is no longer valid.";
       case EGL_BAD_DISPLAY:
          return "An EGLDisplay argument does not name a valid EGL display connection.";
       case EGL_BAD_SURFACE:
          return "An EGLSurface argument does not name a valid surface (window, pixel buffer, or pixmap) "
-               "configured for GL rendering.";
+            "configured for GL rendering.";
       case EGL_BAD_MATCH:
          return "Arguments are inconsistent (for example, a valid context requires buffers not supplied "
-               "by a valid surface).";
+            "by a valid surface).";
       case EGL_BAD_PARAMETER:
          return "One or more argument values are invalid.";
       case EGL_BAD_NATIVE_PIXMAP:
@@ -335,7 +366,7 @@ static const char *eglGetErrorStr() {
          return "A NativeWindowType argument does not refer to a valid native window.";
       case EGL_CONTEXT_LOST:
          return "A power management event has occurred. The application must destroy all "
-               "contexts and reinitialize OpenGL ES state and objects to continue rendering.";
+            "contexts and reinitialize OpenGL ES state and objects to continue rendering.";
       default:
          break;
    }
@@ -344,41 +375,177 @@ static const char *eglGetErrorStr() {
 
 
 static void DrawOnCanvas(RGBMatrix *canvas, uint8_t note, uint8_t velocity) {
-	uint8_t brightness = (float) velocity / 127.0 * 255;
-	canvas->SetBrightness(brightness);
-	switch (note % 3) {
-		case 0:
-			canvas->Fill(0, 0, 255);
-			break;
-		case 1:
-			canvas->Fill(0, 255, 0);
-			break;
-		case 2:
-			canvas->Fill(255, 0, 0);
-			break;
-	}	
+   uint8_t brightness = (float) velocity / 127.0 * 255;
+   canvas->SetBrightness(brightness);
+   switch (note % 3) {
+      case 0:
+         canvas->Fill(0, 0, 255);
+         break;
+      case 1:
+         canvas->Fill(0, 255, 0);
+         break;
+      case 2:
+         canvas->Fill(255, 0, 0);
+         break;
+   }	
+}
+
+static void checkPAErr(PaError err) {
+   if (err != paNoError) {
+      printf("PortAudio error: %s\n", Pa_GetErrorText(err));
+      exit(EXIT_FAILURE);
+   }
+}
+
+static inline float max(float a, float b) {
+   return a > b ? a : b;
+}
+
+static inline float min(float a, float b) {
+   return a < b ? a : b;
+}
+
+static int audioStreamCallback(
+      const void *inputBuffer,
+      void *outputBuffer,
+      unsigned long framesPerBuffer,
+      const PaStreamCallbackTimeInfo *timeInfo,
+      PaStreamCallbackFlags statusFlags,
+      void *userData 
+      ) {
+   
+   float *in = (float *)inputBuffer;
+   (void)outputBuffer;
+   streamCallbackData *callbackData = (streamCallbackData *)userData;   
+
+   int dispSize = 100;
+   printf("\r");
+
+   for (unsigned long i = 0; i < framesPerBuffer; i++) {
+      callbackData->in[i] = in[i * NUM_CHANNELS];
+   }
+   
+   fftw_execute(callbackData->p);
+   
+   for (int i = 0; i < dispSize; i++) {
+      double proportion = i / (double)dispSize;
+      double freq = callbackData->out[(int) (callbackData->startIndex + proportion * callbackData->spectroSize)];
+      if (freq < 0.125) {
+         printf("▁");
+      }
+      else if (freq < 0.25) {
+         printf("▂");
+      }
+      else if (freq < 0.375) {
+         printf("▃");
+      }
+      else if (freq < 0.5) {
+         printf("▄");
+      }
+      else if (freq < 0.625) {
+         printf("▅");
+      }
+      else if (freq < 0.75) {
+         printf("▆");
+      }
+      else if (freq < 0.875) {
+         printf("▇");
+      }
+      else {
+         printf("█");
+      }
+      if (proportion < 0.3 && freq >= 0.275) {
+         ((RGBMatrix *)canvas)->SetBrightness(freq*255);
+      }
+   }
+
+
+   fflush(stdout);
+
+   return 0; 
+}
+
+int portAudioInit() {
+
+   PaError err;
+   err = Pa_Initialize();
+   checkPAErr(err);
+   
+   spectroData = (streamCallbackData *)malloc(sizeof(streamCallbackData));
+   spectroData->in = (double *)malloc(sizeof(double) * FRAMES_PER_BUFFER);
+   spectroData->out = (double *)malloc(sizeof(double) * FRAMES_PER_BUFFER);
+   if (spectroData->in == NULL || spectroData->out == NULL) {
+      printf("Could not allocate spectro data\n");
+      exit(EXIT_FAILURE);
+   }
+   spectroData->p = fftw_plan_r2r_1d(
+      FRAMES_PER_BUFFER, spectroData->in, spectroData->out, FFTW_R2HC, FFTW_MEASURE
+   );
+   double sampleRatio = FRAMES_PER_BUFFER / SAMPLE_RATE;
+   spectroData->startIndex = std::ceil(sampleRatio * SPECTRO_FREQ_START); 
+   spectroData->spectroSize = min(std::ceil(sampleRatio * SPECTRO_FREQ_END),
+                                  FRAMES_PER_BUFFER / 2.0) - spectroData->startIndex;
+   
+   int numDevices = Pa_GetDeviceCount();
+   printf("Number of PA devices: %d\n", numDevices);
+   if (numDevices < 0) {
+      printf("Error getting device count.\n");
+      exit(EXIT_FAILURE);
+   } else if (numDevices == 0) {
+      printf("There are no available audio devices on this machine.\n");
+      exit(EXIT_SUCCESS);
+   }
+
+   const PaDeviceInfo *deviceInfo;
+   for (int i = 0; i < numDevices; i++) {
+      deviceInfo = Pa_GetDeviceInfo(i);
+      printf("Device %d:\n", i);
+      printf(" name: %s\n", deviceInfo->name);
+      printf(" maxInputChannels: %d\n", deviceInfo->maxInputChannels);
+      printf(" maxOutputChannels: %d\n", deviceInfo->maxOutputChannels);
+      printf(" defaultSampleRate: %f\n", deviceInfo->defaultSampleRate);
+   }
+
+   int device = 1;
+
+   PaStreamParameters inputParameters;
+   PaStreamParameters outputParameters;
+
+   memset(&inputParameters, 0, sizeof(inputParameters));
+   inputParameters.channelCount = NUM_CHANNELS;
+   inputParameters.device = device;
+   inputParameters.hostApiSpecificStreamInfo = NULL;
+   inputParameters.sampleFormat = paFloat32;
+   inputParameters.suggestedLatency = Pa_GetDeviceInfo(device)->defaultLowInputLatency;
+
+   err = Pa_OpenStream(
+         &stream,
+         &inputParameters,
+         NULL,
+         SAMPLE_RATE,
+         FRAMES_PER_BUFFER,
+         paNoFlag,
+         audioStreamCallback,
+         spectroData
+         );
+   checkPAErr(err);
+
+   return 0;
 }
 
 int main(int argc, char *argv[]) {
-   size_t n = 64;
-   //double in[n];
-   //std::complex<double> out[n];
-   fftw_complex *in, *out;
-   fftw_plan p;
-   in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * n);
-   out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * n);
-   p = fftw_plan_dft_1d(n, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
-   for (size_t i = 0; i < n; ++i) {
-      double t = (double)i/n;
-      in[i][0] = cos(2*M_PI*t*1) + sin(2*M_PI*t*2) + cos(2*M_PI*t*3);
-      in[i][1] = 0.0;
-   }
-   fftw_execute(p);
-   //fft(in, 1, out, n);
-   for (size_t f = 0; f < n; ++f) {
-      //printf("%02zu: %.2f, %.2f\n", f, real(out[f]), imag(out[f]));
-      printf("%02zu: %.2f, %.2f\n", f, out[f][0], out[f][1]);
-   }
+
+   //Pa_Sleep(10 * 1000);   
+
+
+   //double in[N];
+   //std::complex<double> out[N];
+   //in = (float *) malloc(sizeof(float) * N);
+   //out = (std::complex<float> *) malloc (sizeof(std::complex<float>) * N);
+   //in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+   //out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+   //fftwPlan = fftw_plan_dft_1d(N, in, out, FFTW_FORWARD, FFTW_MEASURE);
+   //fft(in, 1, out, N);
 
    serial_port = open("/dev/ttyACM0", O_RDWR);
    if (serial_port < 0) {
@@ -391,15 +558,16 @@ int main(int argc, char *argv[]) {
    if (tcgetattr(serial_port, &tty) != 0) {
       printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
    }
-   InitAudioDevice();
-   Music music = LoadMusicStream("ecstasy.mp3");
-   assert(music.stream.sampleSize == 32);
-   assert(music.stream.channels == 2); 
-   printf("music.frameCount = %u\n", music.frameCount);
-   printf("music.stream.sampleRate = %u\n", music.stream.sampleRate);
-   printf("music.stream.sampleSize = %u\n", music.stream.sampleSize);
-   printf("music.stream.channels = %u\n", music.stream.channels);
-   
+   //InitAudioDevice();
+   portAudioInit();
+   //Music music = LoadMusicStream("ecstasy.mp3");
+   //assert(music.stream.sampleSize == 32);
+   //assert(music.stream.channels == 2); 
+   //printf("music.frameCount = %u\n", music.frameCount);
+   //printf("music.stream.sampleRate = %u\n", music.stream.sampleRate);
+   //printf("music.stream.sampleSize = %u\n", music.stream.sampleSize);
+   //printf("music.stream.channels = %u\n", music.stream.channels);
+
    tty.c_cflag &= ~PARENB; // Clear parity bit, disabling parity (most common)
    tty.c_cflag &= ~CSTOPB; // Clear stop field, only one stop bit used in communication (most common)
    tty.c_cflag &= ~CSIZE; // Clear all the size bits, then use one of the statements below
@@ -424,15 +592,15 @@ int main(int argc, char *argv[]) {
 
    // Save tty settings, also checking for error
    if (tcsetattr(serial_port, TCSANOW, &tty) != 0) {
-       printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
+      printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
    }
-	const char *port = "9000";
+   const char *port = "9000";
 
-	lo_server_thread st = lo_server_thread_new_with_proto(port, LO_UDP, error);
-	if (!st) {
-		std::cout << "Unable to start server thread\n";
-		return 1;
-	}
+   lo_server_thread st = lo_server_thread_new_with_proto(port, LO_UDP, error);
+   if (!st) {
+      std::cout << "Unable to start server thread\n";
+      return 1;
+   }
 
    uid_t ruid, euid, suid;
    gid_t rgid, egid, sgid;
@@ -459,47 +627,47 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Insufficient user privileges.\n");
       return EXIT_FAILURE;
    }
-   
+
    if (setegid((gid_t)TARGET_GID) == -1) {
       fprintf(stderr, "Insufficient group privileges.\n");
       return EXIT_FAILURE;
    }
 
-	RGBMatrix::Options defaults;
-	defaults.hardware_mapping = "adafruit-hat";
-	defaults.rows = 32;
-	defaults.chain_length = 2;
-	defaults.parallel = 1;
-	defaults.show_refresh_rate = false;
-	canvas = RGBMatrix::CreateFromFlags(&argc, &argv, &defaults);
-	if (canvas == NULL)
-		return 1;
-   
-//   gerr = 0;
-//   if (setresgid(rgid, rgid, rgid) == -1) {
-//      gerr = errno;
-//      if (!gerr)
-//         gerr = EINVAL;
-//   }
-//   uerr = 0;
-//   if (setresuid(ruid, ruid, ruid) == -1) {
-//      uerr = errno;
-//      if (!uerr)
-//         uerr = EINVAL;
-//   }
-//   if (uerr || gerr) {
-//      if (uerr)
-//         fprintf(stderr, "Cannot drop user privileges: %s.\n", strerror(uerr));
-//      if (gerr)
-//         fprintf(stderr, "Cannot drop group privileges: %s.\n", strerror(gerr));
-//      return EXIT_FAILURE;
-//   }
+   RGBMatrix::Options defaults;
+   defaults.hardware_mapping = "adafruit-hat";
+   defaults.rows = 32;
+   defaults.chain_length = 2;
+   defaults.parallel = 1;
+   defaults.show_refresh_rate = false;
+   canvas = RGBMatrix::CreateFromFlags(&argc, &argv, &defaults);
+   if (canvas == NULL)
+      return 1;
 
-	signal(SIGTERM, InterruptHandler);
-	signal(SIGINT, InterruptHandler);
+   //   gerr = 0;
+   //   if (setresgid(rgid, rgid, rgid) == -1) {
+   //      gerr = errno;
+   //      if (!gerr)
+   //         gerr = EINVAL;
+   //   }
+   //   uerr = 0;
+   //   if (setresuid(ruid, ruid, ruid) == -1) {
+   //      uerr = errno;
+   //      if (!uerr)
+   //         uerr = EINVAL;
+   //   }
+   //   if (uerr || gerr) {
+   //      if (uerr)
+   //         fprintf(stderr, "Cannot drop user privileges: %s.\n", strerror(uerr));
+   //      if (gerr)
+   //         fprintf(stderr, "Cannot drop group privileges: %s.\n", strerror(gerr));
+   //      return EXIT_FAILURE;
+   //   }
+
+   signal(SIGTERM, InterruptHandler);
+   signal(SIGINT, InterruptHandler);
 
    EGLDisplay display;
-   
+
    device = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
    if (getDisplay(&display) != 0) {
       device = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -509,7 +677,7 @@ int main(int argc, char *argv[]) {
          return -1;
       }
    }
-   
+
 
    int major, minor;
    GLuint program, vert, frag, vbo, vao, ebo;
@@ -517,7 +685,7 @@ int main(int argc, char *argv[]) {
 
    if (eglInitialize(display, &major, &minor) == EGL_FALSE) {
       fprintf(stderr, "Failed to get EGL version! Error: %s\n",
-               eglGetErrorStr());
+            eglGetErrorStr());
       eglTerminate(display);
       gbmClean();
       return EXIT_FAILURE;
@@ -544,7 +712,7 @@ int main(int argc, char *argv[]) {
    int configIndex = matchConfigToVisual(display, GBM_FORMAT_XRGB8888, configs, numConfigs);
    if (configIndex < 0) {
       fprintf(stderr, "Failed to find matching EGL config! Error: %s\n",
-         eglGetErrorStr());
+            eglGetErrorStr());
       eglTerminate(display);
       gbm_surface_destroy(gbmSurface);
       gbm_device_destroy(gbmDevice);
@@ -555,7 +723,7 @@ int main(int argc, char *argv[]) {
       eglCreateContext(display, configs[configIndex], EGL_NO_CONTEXT, contextAttribs);
    if (context == EGL_NO_CONTEXT) {
       fprintf(stderr, "Failed to create EGL context! Error: %s\n",
-         eglGetErrorStr());
+            eglGetErrorStr());
       eglTerminate(display);
       gbmClean();
       return EXIT_FAILURE;
@@ -565,13 +733,13 @@ int main(int argc, char *argv[]) {
       eglCreateWindowSurface(display, configs[configIndex], gbmSurface, NULL);
    if (surface == EGL_NO_SURFACE) {
       fprintf(stderr, "Failed to create EGL surface! Error: %s\n",
-         eglGetErrorStr());
+            eglGetErrorStr());
       eglDestroyContext(display, context);
       eglTerminate(display);
       gbmClean();
       return EXIT_FAILURE;
    }
-   
+
    free(configs);
    eglMakeCurrent(display, surface, surface, context);
 
@@ -591,71 +759,68 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
    }
 
-//   if (seteuid((uid_t)TARGET_UID) == -1) {
-//      fprintf(stderr, "Insufficient user privileges.\n");
-//      return EXIT_FAILURE;
-//   }
-//   
-//   if (setegid((gid_t)TARGET_GID) == -1) {
-//      fprintf(stderr, "Insufficient group privileges.\n");
-//      return EXIT_FAILURE;
-//   }
+   //   if (seteuid((uid_t)TARGET_UID) == -1) {
+   //      fprintf(stderr, "Insufficient user privileges.\n");
+   //      return EXIT_FAILURE;
+   //   }
+   //   
+   //   if (setegid((gid_t)TARGET_GID) == -1) {
+   //      fprintf(stderr, "Insufficient group privileges.\n");
+   //      return EXIT_FAILURE;
+   //   }
 
-	lo_server_thread_add_method(st, "/quit", "", quit_handler, NULL);
+   lo_server_thread_add_method(st, "/quit", "", quit_handler, NULL);
 
-	lo_server_thread_add_method(st, "/lc4/brightness", NULL, brightness_handler, canvas);
+   lo_server_thread_add_method(st, "/lc4/brightness", NULL, brightness_handler, canvas);
 
    lo_server_thread_add_method(st, "/lc4/exponent", NULL, exponent_handler, NULL);
-	
+
    lo_server_thread_add_method(st, "/lc4/x", NULL, x_handler, NULL);
    lo_server_thread_add_method(st, "/lc4/y", NULL, y_handler, NULL);
 
    lo_server_thread_add_method(st, "/lc4/shader", NULL, shader_handler, NULL);
 
-	lo_server_thread_add_method(st, "/lc4/red", NULL, red_handler, NULL);
-	lo_server_thread_add_method(st, "/lc4/green", NULL, green_handler, NULL);
-	lo_server_thread_add_method(st, "/lc4/blue", NULL, blue_handler, NULL);
-	lo_server_thread_add_method(st, "/lc4/white", NULL, white_handler, NULL);
-	lo_server_thread_add_method(st, "/lc4/clear", NULL, clear_handler, NULL);
+   lo_server_thread_add_method(st, "/lc4/red", NULL, red_handler, NULL);
+   lo_server_thread_add_method(st, "/lc4/green", NULL, green_handler, NULL);
+   lo_server_thread_add_method(st, "/lc4/blue", NULL, blue_handler, NULL);
+   lo_server_thread_add_method(st, "/lc4/white", NULL, white_handler, NULL);
+   lo_server_thread_add_method(st, "/lc4/clear", NULL, clear_handler, NULL);
 
-	lo_server_thread_start(st);
+   lo_server_thread_start(st);
 
-	std::cout << "listening on udp port " << port << std::endl;
+   std::cout << "listening on udp port " << port << std::endl;
 
 
-	//unsigned char inpacket[4];
-	// first open the sequencer device for reading
-	//int seqfd = open(MIDI_DEVICE, O_RDONLY);
-	//if (seqfd == -1) {
-		//printf("Error: cannot open %s\n", MIDI_DEVICE);
-		//printf("errno: %d\n", errno);
-		//exit(1);
-	//}
-   
+   //unsigned char inpacket[4];
+   // first open the sequencer device for reading
+   //int seqfd = open(MIDI_DEVICE, O_RDONLY);
+   //if (seqfd == -1) {
+   //printf("Error: cannot open %s\n", MIDI_DEVICE);
+   //printf("errno: %d\n", errno);
+   //exit(1);
+   //}
+
    glEnable(GL_DEPTH_TEST); 
-   
-   
+
+
 
    float vertices[] = {
-    // first triangle
-     1.0f,  1.0f, 0.0f,  // top right
-     1.0f, -1.0f, 0.0f,  // bottom right
-    -1.0f, -1.0f, 0.0f,  // bottom left
-    // second triangle
-    -1.0f,  1.0f, 0.0f,   // top left
-    -1.0f, -1.0f, 0.0f,  // bottom left
-     1.0f,  1.0f, 0.0f,  // top right
-     
-    
-    
-}; 
+      // first triangle
+      1.0f,  1.0f, 0.0f,  // top right
+      1.0f, -1.0f, 0.0f,  // bottom right
+      -1.0f, -1.0f, 0.0f,  // bottom left
+                           // second triangle
+      -1.0f,  1.0f, 0.0f,   // top left
+      -1.0f, -1.0f, 0.0f,  // bottom left
+      1.0f,  1.0f, 0.0f,  // top right
+   }; 
 
    unsigned int indices[] = {  // note that we start from 0!
       2, 3, 0,   // first triangle
       0, 1, 2    // second triangle
    };  
 
-    // Create VBO
+   // Create VBO
    glGenVertexArrays(1, &vao);
    glGenBuffers(1, &vbo);
 
@@ -668,17 +833,17 @@ int main(int argc, char *argv[]) {
    glBindBuffer(GL_ARRAY_BUFFER, vbo);
    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
 
-   // Get vertex attribute and uniform locations
-   //posLoc = glGetAttribLocation(program, "aPos");
-   //texLoc = glGetAttribLocation(program, "aTexCoord");
-   
+   //   // Get vertex attribute and uniform locations
+   //   //posLoc = glGetAttribLocation(program, "aPos");
+   //   //texLoc = glGetAttribLocation(program, "aTexCoord");
+   //
+   //
+   //   // position attribute
+   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+   glEnableVertexAttribArray(0);
 
-    // position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-   
    // load and create a texture 
-    // -------------------------
+   // -------------------------
    //  unsigned int texture;
    //  // texture
    //  // ---------
@@ -690,10 +855,10 @@ int main(int argc, char *argv[]) {
    //  // set texture filtering parameters
    //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
    //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // load image, create texture and generate mipmaps
+   // load image, create texture and generate mipmaps
    //  int width, height, nrChannels;
-    //stbi_set_flip_vertically_on_load(true); // tell stb_image.h to flip loaded texture's on the y-axis.
-    // The FileSystem::getPath(...) is part of the GitHub repository so we can find files on any IDE/platform; replace it with your own image path.
+   //stbi_set_flip_vertically_on_load(true); // tell stb_image.h to flip loaded texture's on the y-axis.
+   // The FileSystem::getPath(...) is part of the GitHub repository so we can find files on any IDE/platform; replace it with your own image path.
    //  unsigned char *data = stbi_load("./resources/textures/awesomeface.png", &width, &height, &nrChannels, 0);
    //  if (data)
    //  {
@@ -714,7 +879,7 @@ int main(int argc, char *argv[]) {
    std::chrono::time_point<std::chrono::steady_clock> startClock = std::chrono::steady_clock::now();    
    canvas->SetBrightness(brightness);
    int inotifyFd, wd;
-   
+
    inotifyFd = inotify_init();
    if (inotifyFd == -1) {
       exit(1);
@@ -722,11 +887,11 @@ int main(int argc, char *argv[]) {
 
    int flags = fcntl(inotifyFd, F_GETFL);
    if (fcntl(inotifyFd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        fprintf(stderr, "fcntl(F_SETFL)");
+      fprintf(stderr, "fcntl(F_SETFL)");
    }
    wd = inotify_add_watch(inotifyFd, "fence4.frag", IN_MODIFY);
    if (wd == -1) {
-            fprintf(stderr, "inotify_add_watch");
+      fprintf(stderr, "inotify_add_watch");
    }
    struct inotify_event *event = NULL;
    bool first = true;
@@ -735,32 +900,27 @@ int main(int argc, char *argv[]) {
    ShaderGL shader3("texture.vs", "fence3.frag");
    ShaderGL shader4("texture.vs", "fence4.frag");
    ShaderGL shader_render = shader1;
-   PlayMusicStream(music);
-   AttachAudioStreamProcessor(music.stream, audioCallback);
+   //PlayMusicStream(music);
+   //AttachAudioStreamProcessor(music.stream, audioCallback);
+   PaError err = Pa_StartStream(stream);
+   checkPAErr(err);
    while(!interrupt_received) {
-      UpdateMusicStream(music);
-      for (size_t i = 0; i < global_frames_count; ++i) {
-         float t = global_frames[i].left;
-         if (t > 0) {
-         } else {
-         }
-         //printf("%f\n", t);
-      }
+      //UpdateMusicStream(music);
       //printf("\n");
-      
-//		read(seqfd, &inpacket, sizeof(inpacket));
-//		if (inpacket[0] == MIDI_NOTEON) {
-//			DrawOnCanvas(canvas, inpacket[1], inpacket[2]);
-//			//printf("Midi note: %d Velocity: %d\n", inpacket[1], inpacket[2]);
-//			usleep(1*1000);
-//		}
-      
+
+      //		read(seqfd, &inpacket, sizeof(inpacket));
+      //		if (inpacket[0] == MIDI_NOTEON) {
+      //			DrawOnCanvas(canvas, inpacket[1], inpacket[2]);
+      //			//printf("Midi note: %d Velocity: %d\n", inpacket[1], inpacket[2]);
+      //			usleep(1*1000);
+      //		}
+
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
       struct timespec start;
       timespec_get(&start, TIME_UTC);
       glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
       std::chrono::time_point<std::chrono::steady_clock> endClock = std::chrono::steady_clock::now();
-      
+
       std::chrono::steady_clock::duration time_span = endClock - startClock; 
       float nseconds = float(time_span.count()) * std::chrono::steady_clock::period::num / std::chrono::steady_clock::period::den;
       // get matrix's uniform location and set matrix
@@ -783,7 +943,7 @@ int main(int argc, char *argv[]) {
       char buf[BUF_LEN] __attribute__((aligned(8)));
       int n = read(inotifyFd, buf, BUF_LEN);
       char* p = buf;
-      
+
       if(p < buf + n) {
          event = (struct inotify_event*)p;
          uint32_t mask = event->mask;
@@ -810,12 +970,9 @@ int main(int argc, char *argv[]) {
       shader_render.setFloat("u_x", x);
       shader_render.setFloat("u_y", y);
       glBindVertexArray(vao);
-      //glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
       glDrawArrays(GL_TRIANGLES, 0, 6);
-      // Create buffer to hold entire front buffer pixels
-
       glReadPixels(0, 0, panelWidth, panelHeight, GL_RGB, GL_UNSIGNED_BYTE, buffer);
-       
+
       for (int y = 0; y < canvas->height(); y++) {
          for (int x = 0; x < canvas->width(); x++) {
             uint8_t *p = &buffer[(y * canvas->width() + x) * 3];
@@ -823,14 +980,24 @@ int main(int argc, char *argv[]) {
             canvas->SetPixel(x, y, r, g, b);
          }
       }
-      
+
       struct timespec end;
       timespec_get(&end, TIME_UTC);
       long tudiff = (end.tv_nsec / 1000 + end.tv_sec * 1000000) - (start.tv_nsec / 1000 + start.tv_sec * 1000000);
       if (tudiff < 10000001 / FPS) {
          usleep(10000001 / FPS - tudiff);
       }
-	}
+   }
+   err = Pa_StopStream(stream);
+   checkPAErr(err);
+
+   err = Pa_Terminate();
+   fftw_destroy_plan(spectroData->p);
+   fftw_free(spectroData->in);
+   fftw_free(spectroData->out);
+   free(spectroData);
+   printf("\n");
+   checkPAErr(err);
    free(buffer);
    glDeleteVertexArrays(1, &vao);
    glDeleteBuffers(1, &vbo); 
@@ -839,50 +1006,50 @@ int main(int argc, char *argv[]) {
    eglTerminate(display);
    gbmClean();
    close(device);
-	canvas->Clear();
+   canvas->Clear();
    close(serial_port);
-	delete canvas;
-	lo_server_thread_free(st);
-	return EXIT_SUCCESS;
+   delete canvas;
+   lo_server_thread_free(st);
+   return EXIT_SUCCESS;
 }
 
 
 void error(int num, const char *msg, const char *path)
 {
-	printf("liblo server error %d in path %s: %s\n", num, path, msg);
-	fflush(stdout);
+   printf("liblo server error %d in path %s: %s\n", num, path, msg);
+   fflush(stdout);
 }
 
 int brightness_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *canvas) {
-	brightness = argv[0]->f;
+   brightness = argv[0]->f;
    //std::cout << "brightness_handler called: " << brightness << std::endl;
-	((RGBMatrix *)canvas)->SetBrightness(brightness);
-	return 0;
+   ((RGBMatrix *)canvas)->SetBrightness(brightness);
+   return 0;
 }
 
 int exponent_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
-         exponent = argv[0]->f;
-         //std::cout << "exponent_handler called: " << exponent << std::endl;
-         return 0;
+   exponent = argv[0]->f;
+   //std::cout << "exponent_handler called: " << exponent << std::endl;
+   return 0;
 }
 
 int x_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
-         x = argv[0]->f;
-         return 0;
+   x = argv[0]->f;
+   return 0;
 }
 
 int y_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
-         y = argv[0]->f;
-         return 0;
+   y = argv[0]->f;
+   return 0;
 }
 
 int shader_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
-         shader = argv[0]->f;
-         return 0;
+   shader = argv[0]->f;
+   return 0;
 }
 
 int red_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	red = argv[0]->f;
+   red = argv[0]->f;
    int redInt = static_cast<int>(red);
    //std::cout << "red_handler called: " << *((GLint *)colorLoc) << std::endl;
    //glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
@@ -896,100 +1063,100 @@ int red_handler(const char *path, const char *types, lo_arg ** argv, int argc, l
 
 
 int green_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	green = argv[0]->f;
+   green = argv[0]->f;
    int greenInt = static_cast<int>(green);
    std::string msg = "g:" + std::to_string(greenInt);
    char g[5];
    strncpy(g, msg.c_str(), sizeof(g));
    //std::cout << msg << std::endl;
-	write(serial_port, g, msg.length());
-	return 0;
+   write(serial_port, g, msg.length());
+   return 0;
 }
 
 
 int blue_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	blue = argv[0]->f;
+   blue = argv[0]->f;
    int blueInt = static_cast<int>(blue);
    std::string msg = "b:" + std::to_string(blueInt);
    char b[5];
    strncpy(b, msg.c_str(), sizeof(b));
    //std::cout << msg << std::endl;
-	write(serial_port, b, msg.length());
-	return 0;
+   write(serial_port, b, msg.length());
+   return 0;
 }
 
 int white_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	white = argv[0]->f;
+   white = argv[0]->f;
    int whiteInt = static_cast<int>(white);
    std::string msg = "w:" + std::to_string(whiteInt);
    char w[5];
    strncpy(w, msg.c_str(), sizeof(w));
    //std::cout << msg << std::endl;
-	write(serial_port, w, msg.length());
-	return 0;
+   write(serial_port, w, msg.length());
+   return 0;
 }
 
 int clear_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *colorLoc) {
-	unsigned char c[] = {'c'};
+   unsigned char c[] = {'c'};
    write(serial_port, c, 1);
    //glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
-	return 0;
+   return 0;
 }
 
 /* catch any incoming messages, display them, and send them
  * back. */
 int echo_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data)
+      int argc, lo_message data, void *user_data)
 {
-	int i;
-	lo_message m = (lo_message)data;
-	lo_address a = lo_message_get_source(m);
-	lo_server s = (lo_server)user_data;
-	const char *host = lo_address_get_hostname(a);
-	const char *port = lo_address_get_port(a);
+   int i;
+   lo_message m = (lo_message)data;
+   lo_address a = lo_message_get_source(m);
+   lo_server s = (lo_server)user_data;
+   const char *host = lo_address_get_hostname(a);
+   const char *port = lo_address_get_port(a);
 
-	count++;
+   count++;
 
 #ifdef WIN32
-	Sleep(1);
+   Sleep(1);
 #else
-	sleep(1);
+   sleep(1);
 #endif
 
-	printf("path: <%s>\n", path);
-	for (i = 0; i < argc; i++) {
-		printf("arg %d '%c' ", i, types[i]);
-		lo_arg_pp((lo_type)types[i], argv[i]);
-		printf("\n");
-	}
+   printf("path: <%s>\n", path);
+   for (i = 0; i < argc; i++) {
+      printf("arg %d '%c' ", i, types[i]);
+      lo_arg_pp((lo_type)types[i], argv[i]);
+      printf("\n");
+   }
 
-	if (!a) {
-		printf("Couldn't get message source, quitting.\n");
-		done = 1;
-		return 0;
-	}
+   if (!a) {
+      printf("Couldn't get message source, quitting.\n");
+      done = 1;
+      return 0;
+   }
 
-	int r = lo_send_message_from(a, s, path, m);
-	if (r < 0)
-		printf("Error sending back message, socket may have closed.\n");
-	else
-		printf("Sent message back to %s:%s.\n", host, port);
+   int r = lo_send_message_from(a, s, path, m);
+   if (r < 0)
+      printf("Error sending back message, socket may have closed.\n");
+   else
+      printf("Sent message back to %s:%s.\n", host, port);
 
-	if (count >= 3) {
-		printf("Got enough messages, quitting.\n");
-		done = 1;
-	}
+   if (count >= 3) {
+      printf("Got enough messages, quitting.\n");
+      done = 1;
+   }
 
-	return 0;
+   return 0;
 }
 
 int quit_handler(const char *path, const char *types, lo_arg ** argv,
-		int argc, lo_message data, void *user_data)
+      int argc, lo_message data, void *user_data)
 {
-	done = 1;
-	printf("quitting\n\n");
-	fflush(stdout);
+   done = 1;
+   printf("quitting\n\n");
+   fflush(stdout);
 
-	return 0;
+   return 0;
 }
 
