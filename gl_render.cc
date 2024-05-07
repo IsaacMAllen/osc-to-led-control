@@ -43,7 +43,7 @@
 #include "shadergl.h"
 #include <raylib.h>
 #define STB_IMAGE_IMPLEMENTATION
-//#include "stb_image.h"
+#include "stb_image.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -66,9 +66,9 @@ using namespace std::complex_literals;
 #define MIDI_DEVICE "/dev/sequencer"
 #define BUF_LEN (10 * (sizeof(struct inotify_event) + NAME_MAX + 1))
 #define FPS 160
-#define SAMPLE_RATE 48000.0
+#define SAMPLE_RATE 44100.0
 #define FRAMES_PER_BUFFER 512
-#define NUM_CHANNELS 2
+#define NUM_CHANNELS 1
 #define SPECTRO_FREQ_START 20
 #define SPECTRO_FREQ_END 20000
 
@@ -108,13 +108,18 @@ float x = 0.5;
 float y = 0.5;
 int shader = 1;
 int device;
+bool bound = false;
+unsigned int audioTexture;
 drmModeModeInfo mode;
 struct gbm_device *gbmDevice;
 struct gbm_surface *gbmSurface;
 drmModeCrtc *crtc;
 RGBMatrix * canvas;
 uint32_t connectorId;
-
+float *test;
+GLuint vao;
+int width, height, nrChannels;
+unsigned char *data;
 
 void error(int num, const char *m, const char *path);
 
@@ -146,6 +151,7 @@ int y_handler(const char *path, const char *types, lo_arg ** argv,
 int shader_handler(const char *path, const char *types, lo_arg ** argv,
       int argc, lo_message data, void *user_data);
 
+void checkErrGL(int line);
 
 volatile bool interrupt_received = false;
 static void InterruptHandler(int signo) {
@@ -417,52 +423,83 @@ static int audioStreamCallback(
    float *in = (float *)inputBuffer;
    (void)outputBuffer;
    streamCallbackData *callbackData = (streamCallbackData *)userData;   
-
-   int dispSize = 100;
-   printf("\r");
-
+   
    for (unsigned long i = 0; i < framesPerBuffer; i++) {
       callbackData->in[i] = in[i * NUM_CHANNELS];
    }
    
    fftw_execute(callbackData->p);
-   
-   for (int i = 0; i < dispSize; i++) {
-      double proportion = i / (double)dispSize;
-      double freq = callbackData->out[(int) (callbackData->startIndex + proportion * callbackData->spectroSize)];
-      if (freq < 0.125) {
-         printf("▁");
-      }
-      else if (freq < 0.25) {
-         printf("▂");
-      }
-      else if (freq < 0.375) {
-         printf("▃");
-      }
-      else if (freq < 0.5) {
-         printf("▄");
-      }
-      else if (freq < 0.625) {
-         printf("▅");
-      }
-      else if (freq < 0.75) {
-         printf("▆");
-      }
-      else if (freq < 0.875) {
-         printf("▇");
-      }
-      else {
-         printf("█");
-      }
-      if (proportion < 0.3 && freq >= 0.275) {
-         ((RGBMatrix *)canvas)->SetBrightness(freq*255);
+   // Draw the spectrogram
+   int dispSize = 64;
+   for (int i = 0; i < 64; i++) {
+         for (int j = 0; j < 64; j++) {
+            test[i*64 + j] = 1.0;
+         }
+   }
+    for (int j = 0; j < dispSize; j++) {
+        // Sample frequency data logarithmically
+        double proportion = std::pow(j / (double)dispSize, 2);
+        double freq = callbackData->out[(int)(callbackData->startIndex
+            + proportion * callbackData->spectroSize)];
+
+        // Display full block characters with heights based on frequency intensity
+      //   double height = 0.0;
+      //   if (freq < 0.05) {
+      //       height = 0.0;
+      //   } else if (freq < 0.125) {
+      //       height = 1.0 / 8.0;
+      //   } else if (freq < 0.25) {
+      //       height = 2.0 / 8.0;
+      //   } else if (freq < 0.375) {
+      //       height = 3.0 / 8.0;
+      //   } else if (freq < 0.5) {
+      //       height = 0.5;
+      //   } else if (freq < 0.625) {
+      //       height = 5.0 / 8.0;
+      //   } else if (freq < 0.75) {
+      //       height = 6.0 / 8.0;
+      //   } else if (freq < 0.875) {
+      //       height = 7.0 / 8.0;
+      //   } else {
+      //       height = 1.0;
+      //   }
+      //printf("col: %d, height: %f\r", j, height);
+      //fflush(stdout);
+      double height = 64.0 * freq;
+      if (height > 64.0) height = 64.0;
+      for (int i = 0; i < height; i++) {
+         test[i*64 + j] = 0.5;
       }
    }
+   
+    // Display the buffered changes to stdout in the terminal
+   
+   //  glBindVertexArray(vao);
+   // // Upload the audio data to the texture
+   //  glBindTexture(GL_TEXTURE_2D, audioTexture);
 
-
-   fflush(stdout);
-
+    
+   //   // set the texture wrapping parameters
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	// set texture wrapping to GL_REPEAT (default wrapping method)
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   // float * test = (float *)malloc(64*64*sizeof(float));
+   // for (int i = 0; i < 4096; i++) {
+   //    test[i] = 1.0;
+   // }
+   // glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 64, 64, 0, GL_RED, GL_FLOAT, test);
+   // glGenerateMipmap(GL_TEXTURE_2D);
+   // bound = true;
+   // free(test);
    return 0; 
+}
+
+void checkErrGL(int line) {
+   int err = glGetError();
+   if (err != 0) {
+      std::cout << line << ": " << err << std::endl;
+   }
 }
 
 int portAudioInit() {
@@ -533,11 +570,21 @@ int portAudioInit() {
    return 0;
 }
 
+void updateTexture() {
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 64, 64, 0, GL_RED, GL_FLOAT, test);
+   //glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+   glGenerateMipmap(GL_TEXTURE_2D);
+}
+
 int main(int argc, char *argv[]) {
 
+   // // Initialize OpenGL and create the audio texture
+   //  glGenTextures(1, &audioTexture);
+   //  checkErrGL(563);
+
+
    //Pa_Sleep(10 * 1000);   
-
-
+   
    //double in[N];
    //std::complex<double> out[N];
    //in = (float *) malloc(sizeof(float) * N);
@@ -680,7 +727,7 @@ int main(int argc, char *argv[]) {
 
 
    int major, minor;
-   GLuint program, vert, frag, vbo, vao, ebo;
+   GLuint program, vert, frag, vbo, ebo;
    GLint posLoc, texLoc, result;
 
    if (eglInitialize(display, &major, &minor) == EGL_FALSE) {
@@ -806,13 +853,13 @@ int main(int argc, char *argv[]) {
 
    float vertices[] = {
       // first triangle
-      1.0f,  1.0f, 0.0f,  // top right
-      1.0f, -1.0f, 0.0f,  // bottom right
-      -1.0f, -1.0f, 0.0f,  // bottom left
+      1.0f,  1.0f, 0.0f, 1.0f, 1.0f,
+      1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
+      -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
                            // second triangle
-      -1.0f,  1.0f, 0.0f,   // top left
-      -1.0f, -1.0f, 0.0f,  // bottom left
-      1.0f,  1.0f, 0.0f,  // top right
+      -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,
+      -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
+      1.0f,  1.0f, 0.0f,  0.0f, 0.0f
    }; 
 
    unsigned int indices[] = {  // note that we start from 0!
@@ -839,39 +886,33 @@ int main(int argc, char *argv[]) {
    //
    //
    //   // position attribute
-   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
    glEnableVertexAttribArray(0);
+
+   // texture coord attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
 
    // load and create a texture 
    // -------------------------
-   //  unsigned int texture;
-   //  // texture
-   //  // ---------
-   //  glGenTextures(1, &texture);
-   //  glBindTexture(GL_TEXTURE_2D, texture); 
-   //   // set the texture wrapping parameters
-   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	// set texture wrapping to GL_REPEAT (default wrapping method)
-   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-   //  // set texture filtering parameters
-   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-   //  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-   // load image, create texture and generate mipmaps
-   //  int width, height, nrChannels;
-   //stbi_set_flip_vertically_on_load(true); // tell stb_image.h to flip loaded texture's on the y-axis.
-   // The FileSystem::getPath(...) is part of the GitHub repository so we can find files on any IDE/platform; replace it with your own image path.
-   //  unsigned char *data = stbi_load("./resources/textures/awesomeface.png", &width, &height, &nrChannels, 0);
-   //  if (data)
-   //  {
-   //      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-   //      glGenerateMipmap(GL_TEXTURE_2D);
-   //      std::cout << "Loaded Container\n";
-   //  }
-   //  else
-   //  {
-   //      std::cout << "Failed to load texture" << std::endl;
-   //  }
-   //  stbi_image_free(data);
-
+    unsigned int texture;
+    // texture
+    // ---------
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture); 
+     // set the texture wrapping parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	// set texture wrapping to GL_REPEAT (default wrapping method)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    // set texture filtering parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   test = (float *)malloc(64*64*sizeof(float));
+   for (int i = 0; i < 64; i++) {
+      for (int j = 0; j < 64; j++) {
+         test[i*64 + j] = 1.0;
+      }
+   }
+   updateTexture();
    //glUniform4f(colorLoc, 0.0f, 0.0f, 1.0f, 1.0f);
    //glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
    //glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -905,6 +946,9 @@ int main(int argc, char *argv[]) {
    PaError err = Pa_StartStream(stream);
    checkPAErr(err);
    while(!interrupt_received) {
+      updateTexture();
+      // Bind the texture and use it in the shader
+      
       //UpdateMusicStream(music);
       //printf("\n");
 
@@ -919,6 +963,11 @@ int main(int argc, char *argv[]) {
       struct timespec start;
       timespec_get(&start, TIME_UTC);
       glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+      // bind textures on corresponding texture units
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, texture);
+
       std::chrono::time_point<std::chrono::steady_clock> endClock = std::chrono::steady_clock::now();
 
       std::chrono::steady_clock::duration time_span = endClock - startClock; 
@@ -964,11 +1013,16 @@ int main(int argc, char *argv[]) {
             first = false;
          }
       }
+
       shader_render.use();
       shader_render.setVec2("u_resolution", glm::vec2(64.0f, 64.0f));
       shader_render.setFloat("u_time", nseconds);
       shader_render.setFloat("u_x", x);
       shader_render.setFloat("u_y", y);
+      
+
+      
+      
       glBindVertexArray(vao);
       glDrawArrays(GL_TRIANGLES, 0, 6);
       glReadPixels(0, 0, panelWidth, panelHeight, GL_RGB, GL_UNSIGNED_BYTE, buffer);
@@ -999,6 +1053,8 @@ int main(int argc, char *argv[]) {
    printf("\n");
    checkPAErr(err);
    free(buffer);
+   free(test);
+   stbi_image_free(data);
    glDeleteVertexArrays(1, &vao);
    glDeleteBuffers(1, &vbo); 
    eglDestroyContext(display, context);
