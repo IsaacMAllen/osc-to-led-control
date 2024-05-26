@@ -120,6 +120,7 @@ float *test;
 GLuint vao;
 int width, height, nrChannels;
 unsigned char *data;
+bool exitApp = false;
 
 void error(int num, const char *m, const char *path);
 
@@ -149,6 +150,9 @@ int x_handler(const char *path, const char *types, lo_arg ** argv,
 int y_handler(const char *path, const char *types, lo_arg ** argv,
       int argc, lo_message data, void *user_data);
 int shader_handler(const char *path, const char *types, lo_arg ** argv,
+      int argc, lo_message data, void *user_data);
+
+int exitApp_handler(const char *path, const char *types, lo_arg ** argv,
       int argc, lo_message data, void *user_data);
 
 void checkErrGL(int line);
@@ -833,6 +837,8 @@ int main(int argc, char *argv[]) {
    lo_server_thread_add_method(st, "/lc4/white", NULL, white_handler, NULL);
    lo_server_thread_add_method(st, "/lc4/clear", NULL, clear_handler, NULL);
 
+   lo_server_thread_add_method(st, "/lc4/exit", NULL, exitApp_handler, NULL);
+
    lo_server_thread_start(st);
 
    std::cout << "listening on udp port " << port << std::endl;
@@ -930,22 +936,22 @@ int main(int argc, char *argv[]) {
    if (fcntl(inotifyFd, F_SETFL, flags | O_NONBLOCK) == -1) {
       fprintf(stderr, "fcntl(F_SETFL)");
    }
-   wd = inotify_add_watch(inotifyFd, "fence4.frag", IN_MODIFY);
+   wd = inotify_add_watch(inotifyFd, "/home/isea/lc4midi/fence4.frag", IN_MODIFY);
    if (wd == -1) {
       fprintf(stderr, "inotify_add_watch");
    }
    struct inotify_event *event = NULL;
    bool first = true;
-   ShaderGL shader1("texture.vs", "fence1.frag");
-   ShaderGL shader2("texture.vs", "fence2.frag");
-   ShaderGL shader3("texture.vs", "fence3.frag");
-   ShaderGL shader4("texture.vs", "fence4.frag");
+   ShaderGL shader1("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence1.frag");
+   ShaderGL shader2("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence2.frag");
+   ShaderGL shader3("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence3.frag");
+   ShaderGL shader4("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence4.frag");
    ShaderGL shader_render = shader1;
    //PlayMusicStream(music);
    //AttachAudioStreamProcessor(music.stream, audioCallback);
    PaError err = Pa_StartStream(stream);
    checkPAErr(err);
-   while(!interrupt_received) {
+   while(!interrupt_received && !exitApp) {
       updateTexture();
       // Bind the texture and use it in the shader
       
@@ -998,7 +1004,7 @@ int main(int argc, char *argv[]) {
          uint32_t mask = event->mask;
          if (mask & IN_MODIFY && !first) {
             first = true;
-            ShaderGL newShader("texture.vs", "fence4.frag");
+            ShaderGL newShader("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence4.frag");
             shader_render = newShader;
             shader4 = newShader;
             shader = 4;
@@ -1156,6 +1162,11 @@ int clear_handler(const char *path, const char *types, lo_arg ** argv, int argc,
    unsigned char c[] = {'c'};
    write(serial_port, c, 1);
    //glUniform4f(*((GLint *)colorLoc), red, green, blue, 1.0f);
+   return 0;
+}
+
+int exitApp_handler(const char *path, const char *types, lo_arg ** argv, int argc, lo_message data, void *user_data) {
+   exitApp = true;
    return 0;
 }
 
