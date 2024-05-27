@@ -865,7 +865,7 @@ int main(int argc, char *argv[]) {
                            // second triangle
       -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,
       -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
-      1.0f,  1.0f, 0.0f,  0.0f, 0.0f
+      1.0f,  1.0f, 0.0f,  1.0f, 1.0f
    }; 
 
    unsigned int indices[] = {  // note that we start from 0!
@@ -946,6 +946,7 @@ int main(int argc, char *argv[]) {
    ShaderGL shader2("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence2.frag");
    ShaderGL shader3("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence3.frag");
    ShaderGL shader4("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/fence4.frag");
+   ShaderGL shader5("/home/isea/lc4midi/texture.vs", "/home/isea/lc4midi/face.frag");
    ShaderGL shader_render = shader1;
    //PlayMusicStream(music);
    //AttachAudioStreamProcessor(music.stream, audioCallback);
@@ -993,6 +994,9 @@ int main(int argc, char *argv[]) {
          case 4:
             shader_render = shader4;
             shader_render.setFloat("u_exponent", exponent);
+            break;
+         case 5:
+            shader_render = shader5;
             break;
       }
       char buf[BUF_LEN] __attribute__((aligned(8)));
